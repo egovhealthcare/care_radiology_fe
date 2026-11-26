@@ -1,41 +1,251 @@
-import { FC } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { DicomStudy } from "@/types/Dicom";
-import { apis } from "@/apis";
-import React from "react";
+import { FC, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import RadiologyStudyTable from "./RadiologyStudyTable";
-import { Card, CardContent } from "./ui/card";
+import DicomUploader from "./DicomUploader";
+import { Card, CardContent } from "@/components/ui/card";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Label } from "@radix-ui/react-label";
+import { PlugConfigMeta } from "@/types/plugin";
+import { EncounterStatus } from "@/types/encounter";
+import { useServiceRequestDetail } from "@/hooks/useServiceRequestDetail";
+import {
+  imagingStudyQueryKey,
+  useRadiologyStudies,
+} from "@/hooks/useRadiologyStudies";
+import { useHostSiblingsHidden } from "@/hooks/useHostSiblingsHidden";
+import { useRadiologyPermissions } from "@/hooks/useRadiologyPermissions";
+import { useImagingStudyCompletionSync } from "@/hooks/useImagingStudyCompletionSync";
+import { allowsDiagnosticReportWithoutActiveStudy } from "@/utils/pluginConfig";
+import { Button } from "@/components/ui/button";
+import { useTranslation } from "react-i18next";
+import { PLUGIN_SLUG, SERVICE_REQUEST_OVERRIDE_CATEGORY } from "@/constants";
+import { Plus } from "lucide-react";
+import { toast } from "@/lib/utils";
 
 type SRProps = {
   serviceRequestId: string;
+  __meta?: PlugConfigMeta;
 };
-export const ServiceRequestView: FC<SRProps> = ({ serviceRequestId }) => {
-  const { data: dicomStudies } = useQuery<DicomStudy[]>({
-    queryKey: ["dicomimagelist", serviceRequestId],
-    queryFn: () =>
-      apis.servicerequest.fetchStudies({
-        serviceRequestId,
-      }),
-    enabled: true,
+
+export const ServiceRequestView: FC<SRProps> = ({
+  serviceRequestId,
+  __meta,
+}) => {
+  const { t } = useTranslation(PLUGIN_SLUG);
+  const queryClient = useQueryClient();
+  const [showUploader, setShowUploader] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  const facilityId = useMemo(() => {
+    const match = window.location.pathname.match(/\/facility\/([^/]+)/);
+    return match?.[1];
+  }, []);
+
+  const {
+    canReadRadiology,
+    canWriteRadiology,
+    isLoading: isPermissionLoading,
+    isError: isPermissionError,
+  } = useRadiologyPermissions(facilityId);
+
+  const { data: serviceRequestDetail } = useServiceRequestDetail(
+    facilityId,
+    serviceRequestId,
+  );
+
+  const isRadiologyRequest =
+    serviceRequestDetail?.category === SERVICE_REQUEST_OVERRIDE_CATEGORY;
+  const patientId = serviceRequestDetail?.encounter?.patient?.id;
+  const encounterId = serviceRequestDetail?.encounter?.id;
+
+  const {
+    data: dicomStudies,
+    imagingStudy,
+    isSuccess: studiesLoaded,
+    isError: studiesLoadFailed,
+  } = useRadiologyStudies(
+    isRadiologyRequest ? patientId : undefined,
+    serviceRequestId,
+  );
+
+  useImagingStudyCompletionSync({
+    serviceRequest: serviceRequestDetail,
+    imagingStudy,
+    canWriteRadiology,
   });
+
+  useEffect(() => {
+    if (studiesLoadFailed) {
+      toast.error(t("radiology_failed_to_load_studies"));
+    }
+  }, [studiesLoadFailed, t]);
+
+  const hasDiagnosticReports =
+    (serviceRequestDetail?.diagnostic_reports?.length ?? 0) > 0;
+  const hasActiveStudy = (dicomStudies ?? []).some(
+    (study) => !study.is_archived,
+  );
+  const isServiceRequestActive = serviceRequestDetail?.status === "active";
+
+  const isUploadStage = isServiceRequestActive && !hasDiagnosticReports;
+
+  useEffect(() => {
+    if (!isPermissionLoading && isRadiologyRequest && !canReadRadiology) {
+      toast.error(
+        t(
+          isPermissionError
+            ? "radiology_permission_check_failed"
+            : "radiology_no_permission",
+        ),
+      );
+    }
+  }, [
+    isPermissionLoading,
+    isPermissionError,
+    isRadiologyRequest,
+    canReadRadiology,
+    t,
+  ]);
+
+  const blockReportCreation =
+    isRadiologyRequest &&
+    studiesLoaded &&
+    !hasDiagnosticReports &&
+    !hasActiveStudy &&
+    !allowsDiagnosticReportWithoutActiveStudy(__meta);
+
+  useHostSiblingsHidden(rootRef, blockReportCreation);
+
+  const hasStudies = (dicomStudies?.length ?? 0) > 0;
+  const isNonRadiologyRequest =
+    !!serviceRequestDetail && !isRadiologyRequest;
+  if (
+    !(canReadRadiology || canWriteRadiology) ||
+    isNonRadiologyRequest ||
+    (!serviceRequestDetail && !hasStudies)
+  ) {
+    return null;
+  }
+
+  const canUploadDicom =
+    canWriteRadiology && isUploadStage && (studiesLoaded || !canReadRadiology);
+
+  const canArchive =
+    canWriteRadiology &&
+    serviceRequestDetail?.status !== "completed" &&
+    serviceRequestDetail?.encounter?.status !== EncounterStatus.completed;
+
+  const invalidateServiceRequestQueries = () => {
+    queryClient.invalidateQueries({
+      queryKey: imagingStudyQueryKey(patientId, serviceRequestId),
+    });
+  };
+
+  const handleUploaderClose = () => {
+    setShowUploader(false);
+  };
+
   return (
-    <React.Fragment>
-      {dicomStudies && dicomStudies.length > 0 && (
+    <div ref={rootRef}>
+      {hasStudies && (
         <Card className="mb-4 shadow-none rounded-lg border-gray-200 bg-gray-50">
           <CardContent className="p-4">
-            <div className="grid gap-4">
-              <div className="flex justify-between items-start">
+            <div className="grid gap-4 min-w-0">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <Label className="text-base font-semibold text-gray-950">
-                  Radiology Studies
+                  {t("radiology_studies")}
                 </Label>
+                {canUploadDicom && (
+                  <Button
+                    variant="primary"
+                    className="shrink-0"
+                    onClick={() => setShowUploader(true)}
+                  >
+                    <Plus className="size-4 mr-1" />
+                    {t("dicom_upload_data")}
+                  </Button>
+                )}
               </div>
-              <RadiologyStudyTable studies={dicomStudies}></RadiologyStudyTable>
+              <RadiologyStudyTable
+                studies={dicomStudies}
+                canArchive={canArchive}
+                onArchived={invalidateServiceRequestQueries}
+                patientId={patientId}
+              />
             </div>
           </CardContent>
         </Card>
       )}
-    </React.Fragment>
+
+      {
+        canUploadDicom && !hasStudies && (
+          <Card className="mb-4 shadow-none rounded-lg border-gray-200 bg-gray-50">
+            <CardContent className="p-8">
+              <div className="flex flex-col gap-4 items-center">
+                <div className="text-center">
+                  <Label className="text-base font-semibold text-gray-950">
+                    {t("dicom_upload_files_heading")}
+                  </Label>
+                  {canReadRadiology && (
+                    <p className="mt-2 text-sm text-gray-500">
+                      {t("service_request_dicom_no_studies_found")}
+                    </p>
+                  )}
+                  {imagingStudy?.accession_number && (
+                    <p className="mt-2 text-sm text-gray-700">
+                      {t("radiology_accession_number")}:{" "}
+                      <span className="font-semibold text-gray-950">
+                        {imagingStudy.accession_number}
+                      </span>
+                    </p>
+                  )}
+                </div>
+                <div className="flex justify-center">
+                  <Button
+                    variant="primary"
+                    onClick={() => setShowUploader(true)}
+                  >
+                    <Plus className="size-4 mr-1" />
+                      {t("dicom_upload_data")}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )
+      }
+
+      {blockReportCreation && (
+        <Card className="mb-4 shadow-none rounded-lg border-gray-200 bg-gray-50">
+          <CardContent className="flex items-start gap-3 p-4">
+            <p className="text-sm text-gray-700">
+              {t("radiology_report_needs_active_study")}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {canUploadDicom && patientId && encounterId && (
+        <Dialog
+          open={showUploader}
+          onOpenChange={(open) => !open && handleUploaderClose()}
+        >
+          <DialogContent
+            className="max-w-[calc(100%-2rem)] sm:max-w-4xl max-h-[90vh] flex flex-col overflow-hidden gap-0 p-0"
+            hideCloseButton
+          >
+            <DicomUploader
+              patientId={patientId}
+              encounterId={encounterId}
+              serviceRequestId={serviceRequestId}
+              accessionNumber={imagingStudy?.accession_number}
+              onClose={handleUploaderClose}
+              onUploadSuccess={invalidateServiceRequestQueries}
+            />
+          </DialogContent>
+        </Dialog>
+      )}
+    </div>
   );
 };
 

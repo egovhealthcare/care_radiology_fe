@@ -3,21 +3,34 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
+  CopyX,
+  Ban,
   FolderPlus,
   FilePlus,
-  Eye,
+  Info,
 } from "lucide-react";
-import { navigate } from "raviger";
-import { useState, useRef, useEffect } from "react";
-import { Button } from "./ui/button";
+import { useState, useRef } from "react";
+import { Button } from "@/components/ui/button";
 import { useTranslation } from "react-i18next";
-import { Card, CardHeader, CardTitle, CardContent } from "./ui/card";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { apis } from "@/apis";
-import { Toaster } from "sonner";
+import { APIError } from "@/apis/request";
 import { toast } from "@/lib/utils";
 import { PLUGIN_SLUG } from "@/constants";
 
-type FileStatus = "pending" | "uploading" | "success" | "failed";
+type FileStatus =
+  "pending" | "uploading" | "success" | "failed" | "duplicate" | "rejected";
+
+type AccessionErrorType =
+  | "accession_number_missing"
+  | "accession_number_unreadable"
+  | "accession_number_mismatch";
+
+const ACCESSION_ERROR_TYPES: AccessionErrorType[] = [
+  "accession_number_missing",
+  "accession_number_unreadable",
+  "accession_number_mismatch",
+];
 
 interface DicomFile {
   id: string;
@@ -27,115 +40,225 @@ interface DicomFile {
   study_uid?: string;
 }
 
+const STUDY_LINK_CONFLICT_REASONS: [prefix: string, key: string][] = [
+  [
+    "Study is already linked to another patient",
+    "dicom_study_linked_other_patient",
+  ],
+  [
+    "Study is already linked to this encounter without a service request",
+    "dicom_study_linked_this_encounter",
+  ],
+  [
+    "Study is already linked to a different encounter",
+    "dicom_study_linked_other_encounter",
+  ],
+  [
+    "Study is already linked to a different service request",
+    "dicom_study_already_linked",
+  ],
+];
+
+function getStudyLinkConflictKey(error: unknown): string | null {
+  if (!(error instanceof APIError)) return null;
+  if (error.status !== 400 && error.status !== 409) return null;
+  const errors = (error.data as { errors?: unknown } | null)?.errors;
+  const first = Array.isArray(errors) ? errors[0] : null;
+  if (first?.type !== "study_link_conflict") return null;
+  const msg = typeof first.msg === "string" ? first.msg : "";
+  const reason = STUDY_LINK_CONFLICT_REASONS.find(([prefix]) =>
+    msg.startsWith(prefix),
+  );
+  return reason ? reason[1] : "dicom_study_already_linked";
+}
+
+function getAccessionError(error: unknown): AccessionErrorType | null {
+  if (!(error instanceof APIError) || error.status !== 400) return null;
+  const errors = (error.data as { errors?: unknown } | null)?.errors;
+  const type = Array.isArray(errors) ? errors[0]?.type : null;
+  return ACCESSION_ERROR_TYPES.includes(type) ? type : null;
+}
+
 export default function DicomUploader({
   patientId,
+  encounterId,
+  serviceRequestId,
+  accessionNumber,
+  onClose,
+  onUploadSuccess,
 }: {
   patientId: string;
   encounterId: string;
+  serviceRequestId?: string;
+  accessionNumber?: string | null;
+  onClose: () => void;
+  onUploadSuccess?: () => void;
 }) {
   const [files, setFiles] = useState<DicomFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
-  const [successfulLink, setSuccessfulLink] = useState<string | null>(null);
+  const [uploadDone, setUploadDone] = useState(false);
 
   const folderInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const goBack = () => window.history.back();
-
   const { t } = useTranslation(PLUGIN_SLUG);
   const { t: baseTranslate } = useTranslation();
 
-  useEffect(() => {
-      if (isUploading == false) {
-        const studyUid = files.find(
-          (f) => f?.study_uid && f?.study_uid != ""
-        )?.study_uid;
-        if (!studyUid) return;
-        const link = `/radiology/view/${studyUid}`;
-        if (link) {
-          setSuccessfulLink(link);
-          toast.success(
-            <div className="flex gap-1">
-              <span>Files uploaded successfully.</span>
-              <a className="underline" href={link}>
-                View Study.
-              </a>
-            </div>
-          );
-        }
-      }
-  }, [isUploading, files]);
-
-  const handleFolderSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = event.target.files;
-    if (!selectedFiles) return;
-    const dicomFiles = Array.from(selectedFiles).map((file, index) => ({
-      id: `${Date.now()}-${index}`,
-      name: file.name,
-      file,
-      status: "pending" as FileStatus,
-    }));
-    setFiles((prev) => [...prev, ...dicomFiles]);
+  const setFileStatus = (index: number, patch: Partial<DicomFile>) => {
+    setFiles((prev) =>
+      prev.map((f, i) => (i === index ? { ...f, ...patch } : f)),
+    );
   };
 
-  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFilesPicked = (event: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = event.target.files;
     if (!selectedFiles) return;
-    const dicomFiles = Array.from(selectedFiles).map((file, index) => ({
+    const picked = Array.from(selectedFiles);
+    const accepted = picked.filter((file) => {
+      const name = file.name.toLowerCase();
+      return name.endsWith(".dcm") || name.endsWith(".dicom");
+    });
+    const dicomFiles = accepted.map((file, index) => ({
       id: `${Date.now()}-${index}`,
       name: file.name,
       file,
       status: "pending" as FileStatus,
     }));
+    if (accepted.length < picked.length) {
+      toast.error(
+        t("dicom_files_skipped_not_dcm", {
+          count: picked.length - accepted.length,
+        }),
+      );
+    }
+    if (accepted.length === 0) return;
     setFiles((prev) => [...prev, ...dicomFiles]);
+    setUploadDone(false);
   };
 
   const handleSave = async () => {
     if (files.length === 0 || isUploading) return;
     setIsUploading(true);
-    const counts = { success: 0, failed: 0 };
+    const linkConflictKeys = new Set<string>();
+    const counts = {
+      success: 0,
+      failed: 0,
+      duplicate: 0,
+      linkConflict: 0,
+      accession_number_missing: 0,
+      accession_number_unreadable: 0,
+      accession_number_mismatch: 0,
+    };
+    let uploadedStudyUid: string | undefined;
+    let statusMarked = false;
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      setFiles((prev) =>
-        prev.map((f, index) =>
-          index === i ? { ...f, status: "uploading" } : f
-        )
-      );
+      if (file.status !== "pending" && file.status !== "failed") continue;
+      setFileStatus(i, { status: "uploading" });
 
       const formData = new FormData();
       formData.append("file", file.file);
-      formData.append("filename", file.name);
-      formData.append("patient_id", patientId);
+      formData.append("encounter_id", encounterId);
+      if (serviceRequestId) {
+        formData.append("service_request_id", serviceRequestId);
+      }
 
       try {
-        const response = await apis.dicom.upload(formData);
-        counts[response.message.includes("success") ? "success" : "failed"] =
-          counts[
-            response.message.includes("success") ? "success" : "failed"
-          ] += 1;
-        setFiles((prev) =>
-          prev.map((f, index) =>
-            index === i
-              ? {
-                  ...f,
-                  status: response.message.includes("success")
-                    ? "success"
-                    : "failed",
-                  study_uid: response.study_uid,
-                }
-              : f
-          )
-        );
-      } catch (_) {
-        setFiles((prev) =>
-          prev.map((f, index) => (index === i ? { ...f, status: "failed" } : f))
-        );
+        const response = await apis.imagingStudy.upload(patientId, formData);
+        const isSuccess = response.message.includes("success");
+        counts[isSuccess ? "success" : "failed"] += 1;
+        if (isSuccess && response.study_uid) {
+          uploadedStudyUid = response.study_uid;
+        }
+
+        if (isSuccess && serviceRequestId && !statusMarked) {
+          statusMarked = true;
+          try {
+            await apis.imagingStudy.updateStatus(patientId, serviceRequestId, {
+              status: "in_progress",
+            });
+          } catch {
+            toast.error(t("dicom_status_update_failed"));
+          }
+        }
+        setFileStatus(i, {
+          status: isSuccess ? "success" : "failed",
+          study_uid: response.study_uid,
+        });
+      } catch (error) {
+        const linkConflictKey = getStudyLinkConflictKey(error);
+        if (linkConflictKey) {
+          counts.linkConflict += 1;
+          linkConflictKeys.add(linkConflictKey);
+          setFileStatus(i, { status: "rejected" });
+          continue;
+        }
+        const accessionError = getAccessionError(error);
+        if (accessionError) {
+          counts[accessionError] += 1;
+          setFileStatus(i, { status: "rejected" });
+          continue;
+        }
+        const isDuplicate = error instanceof APIError && error.status === 409;
+        counts[isDuplicate ? "duplicate" : "failed"] += 1;
+        setFileStatus(i, { status: isDuplicate ? "duplicate" : "failed" });
       }
     }
 
+    if (counts.duplicate) {
+      toast.error(t("dicom_duplicate_file"));
+    }
+
+    linkConflictKeys.forEach((key) => toast.error(t(key)));
+
+    if (counts.accession_number_missing) {
+      toast.error(
+        t("dicom_accession_number_missing", {
+          count: counts.accession_number_missing,
+        }),
+      );
+    }
+
+    if (counts.accession_number_unreadable) {
+      toast.error(
+        t("dicom_accession_number_unreadable", {
+          count: counts.accession_number_unreadable,
+        }),
+      );
+    }
+
+    if (counts.accession_number_mismatch) {
+      toast.error(
+        t("dicom_accession_number_mismatch", {
+          count: counts.accession_number_mismatch,
+        }),
+      );
+    }
+
     if (counts.failed) {
-      toast.error(`${counts.failed} files failed. ${counts.success} uploaded.`);
+      toast.error(
+        t("dicom_upload_summary_failed", {
+          failed: counts.failed,
+          success: counts.success,
+        }),
+      );
+    }
+
+    if (uploadedStudyUid) {
+      onUploadSuccess?.();
+      toast.success(t("dicom_files_uploaded_successfully"));
+    }
+
+    if (
+      counts.failed === 0 &&
+      counts.duplicate === 0 &&
+      counts.linkConflict === 0 &&
+      counts.accession_number_missing === 0 &&
+      counts.accession_number_unreadable === 0 &&
+      counts.accession_number_mismatch === 0
+    ) {
+      setUploadDone(true);
     }
 
     setIsUploading(false);
@@ -147,6 +270,10 @@ export default function DicomUploader({
         return <CheckCircle2 className="h-5 w-5 text-green-500" />;
       case "failed":
         return <XCircle className="h-5 w-5 text-red-500" />;
+      case "duplicate":
+        return <CopyX className="h-5 w-5 text-amber-500" />;
+      case "rejected":
+        return <Ban className="h-5 w-5 text-red-500" />;
       case "uploading":
         return <Clock className="h-5 w-5 text-blue-500 animate-pulse" />;
       default:
@@ -156,27 +283,29 @@ export default function DicomUploader({
 
   const uploadedCount = files.filter((f) => f.status === "success").length;
   const failedCount = files.filter((f) => f.status === "failed").length;
+  const duplicateCount = files.filter((f) => f.status === "duplicate").length;
+  const rejectedCount = files.filter((f) => f.status === "rejected").length;
   const pendingCount = files.filter((f) => f.status === "pending").length;
+  const isUploadDone = uploadDone && !isUploading;
 
   return (
-    <div>
-      <Card className="h-full shadow-sm border border-gray-200 bg-white">
-        <CardHeader className="flex flex-row items-center justify-between pb-3">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <Card className="flex min-h-0 flex-1 flex-col shadow-sm border border-gray-200 bg-white">
+        <CardHeader className="flex shrink-0 flex-col items-stretch gap-3 space-y-0 p-4 pb-3 sm:flex-row sm:items-center sm:justify-between sm:p-6 sm:pb-4">
           <CardTitle className="text-xl font-semibold text-gray-800">
             {t("dicom_uploader")}
           </CardTitle>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
             <Button
               onClick={() => folderInputRef.current?.click()}
               disabled={isUploading}
-              className="gap-2"
+              className="flex-1 gap-2 sm:flex-none"
               variant="outline"
             >
               <div className="flex items-center gap-2">
-                <FolderPlus className="h-4 w-4" />
-                Upload Folder
+                <FolderPlus className="h-4 w-4 shrink-0" />
+                <span className="truncate">{t("dicom_upload_folder")}</span>
               </div>
-              {/* Folder */}
             </Button>
             <input
               ref={folderInputRef}
@@ -184,35 +313,49 @@ export default function DicomUploader({
               multiple
               // @ts-expect-error - works for directories
               webkitdirectory=""
-              onChange={handleFolderSelect}
+              onChange={handleFilesPicked}
               className="hidden"
               accept=".dcm,.dicom"
             />
             <Button
               onClick={() => fileInputRef.current?.click()}
               disabled={isUploading}
-              className="gap-2"
+              className="flex-1 gap-2 sm:flex-none"
               variant="outline"
             >
               <div className="flex items-center gap-2">
-                <FilePlus className="h-4 w-4" />
-                Upload Files
+                <FilePlus className="h-4 w-4 shrink-0" />
+                <span className="truncate">
+                  {t("dicom_upload_files_button")}
+                </span>
               </div>
             </Button>
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              onChange={handleFileSelect}
+              onChange={handleFilesPicked}
               className="hidden"
               accept=".dcm,.dicom"
             />
           </div>
         </CardHeader>
 
-        <CardContent className="pt-0">
+        {accessionNumber && (
+          <div className="shrink-0 px-4 pb-3 sm:px-6 sm:pb-4">
+            <div className="flex items-center gap-2 rounded-md border border-blue-200 bg-blue-50 p-3">
+              <Info className="size-4 shrink-0 text-blue-600" />
+              <p className="text-sm text-blue-800">
+                {t("dicom_accession_number_note")}{" "}
+                <span className="font-semibold">{accessionNumber}</span>
+              </p>
+            </div>
+          </div>
+        )}
+
+        <CardContent className="flex min-h-0 flex-1 flex-col p-4 pt-0 sm:p-6 sm:pt-0">
           {files.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-20 text-center text-gray-500">
+            <div className="flex flex-col items-center justify-center py-12 text-center text-gray-500">
               <FolderPlus className="h-16 w-16 text-gray-300 mb-4" />
               <h3 className="text-lg font-medium mb-2">
                 {baseTranslate("no_files_attached")}
@@ -223,43 +366,66 @@ export default function DicomUploader({
             </div>
           ) : (
             <>
-              <div className="mb-4 p-3 rounded-md bg-gray-50 border border-gray-100 text-sm text-gray-700 font-bold">
+              <div className="mb-4 shrink-0 p-3 rounded-md bg-gray-50 border border-gray-100 text-sm text-gray-700 font-bold">
                 {uploadedCount > 0 && (
                   <span className="text-green-600">
-                    {uploadedCount} uploaded.{" "}
+                    {t("dicom_files_uploaded_count", {
+                      count: uploadedCount,
+                    })}{" "}
                   </span>
                 )}
                 {failedCount > 0 && (
                   <span className="text-red-500">
-                    {failedCount} failed.{" "}
+                    {t("dicom_files_failed_count", { count: failedCount })}{" "}
+                  </span>
+                )}
+                {duplicateCount > 0 && (
+                  <span className="text-amber-600">
+                    {t("dicom_files_duplicate_count", {
+                      count: duplicateCount,
+                    })}{" "}
+                  </span>
+                )}
+                {rejectedCount > 0 && (
+                  <span className="text-red-500">
+                    {t("dicom_files_rejected_count", {
+                      count: rejectedCount,
+                    })}{" "}
                   </span>
                 )}
                 {pendingCount > 0 && !isUploading && (
                   <span className="text-gray-500">
-                    {files.length} ready for upload.
+                    {t("dicom_files_ready_count", { count: pendingCount })}
                   </span>
                 )}
                 {isUploading && (
                   <span className="text-blue-600">
-                    Uploading... {uploadedCount + failedCount} / {files.length}
+                    {t("dicom_uploading_progress", {
+                      current:
+                        uploadedCount +
+                        failedCount +
+                        duplicateCount +
+                        rejectedCount,
+                      total: files.length,
+                    })}
                   </span>
                 )}
               </div>
 
-              <ScrollArea className="max-h-[70vh] overflow-y-auto rounded-md border border-gray-100 bg-gray-50/40 p-3">
+              <ScrollArea className="min-h-0 flex-1 overflow-y-auto rounded-md border border-gray-100 bg-gray-50/40 p-3">
                 <div className="space-y-2">
                   {files.map((file, index) => (
                     <div
                       key={file.id}
                       className="flex items-center gap-3 p-2 rounded-md bg-white border border-gray-100 hover:bg-gray-50 transition"
                     >
-                      <span className="text-xs font-medium text-gray-400 w-10">
+                      <span className="w-10 shrink-0 text-xs font-medium text-gray-400">
                         #{index + 1}
                       </span>
-                      <span className="flex-1 text-sm text-gray-700 truncate">
+                      <span className="min-w-0 flex-1 text-sm text-gray-700 truncate">
                         {file.name}
                       </span>
-                      <div className="flex gap-3">
+                      <div className="flex shrink-0 gap-3">
                         {getStatusIcon(file.status)}
                       </div>
                     </div>
@@ -268,39 +434,33 @@ export default function DicomUploader({
               </ScrollArea>
             </>
           )}
-          <div className="flex justify-end gap-3 mt-6">
+          <div className="mt-6 flex shrink-0 flex-wrap justify-end gap-3">
             <Button
-              onClick={() => goBack()}
+              onClick={onClose}
               size="sm"
-              variant="outline"
-              className="min-w-[100px]"
+              variant={isUploadDone ? "primary" : "outline"}
+              className="flex-1 min-w-[100px] sm:flex-none"
             >
-              {baseTranslate("cancel")}
+              {isUploadDone ? baseTranslate("done") : baseTranslate("cancel")}
             </Button>
-            {successfulLink && !isUploading && (
+            {!isUploadDone && (
               <Button
-                onClick={() => navigate(successfulLink)}
-                disabled={isUploading || !successfulLink}
+                onClick={handleSave}
+                disabled={
+                  isUploading ||
+                  files.every(
+                    (f) => f.status !== "pending" && f.status !== "failed",
+                  )
+                }
                 size="sm"
-                className="min-w-[100px]"
+                className="flex-1 min-w-[100px] sm:flex-none"
               >
-                View Study
+                {isUploading ? t("dicom_uploading") : baseTranslate("upload")}
               </Button>
             )}
-            <Button
-              onClick={handleSave}
-              disabled={
-                isUploading || files.every((f) => f.status !== "pending")
-              }
-              size="sm"
-              className="min-w-[100px]"
-            >
-              {isUploading ? "Uploading..." : baseTranslate("upload")}
-            </Button>
           </div>
         </CardContent>
       </Card>
-      <Toaster />
     </div>
   );
 }

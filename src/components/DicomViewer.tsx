@@ -1,33 +1,129 @@
-import { RefObject, useEffect, useRef, useState } from "react";
-import { Button } from "./ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
+import { RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useTranslation } from "react-i18next";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { format } from "date-fns";
 import { PLUGIN_SLUG } from "@/constants";
-import { PlugConfigMeta } from "@/types/plugin";
+import { useRadiologyViewerBaseUrl } from "@/hooks/useRadiologyViewerBaseUrl";
+import { useRadiologyPermissions } from "@/hooks/useRadiologyPermissions";
+import { toast } from "@/lib/utils";
+import { apis } from "@/apis";
+import { EmptyState } from "@/components/ui/empty-state";
+import { useEncounterImagingStudies } from "@/hooks/useRadiologyStudies";
+import { useServiceRequestDetail } from "@/hooks/useServiceRequestDetail";
+import { formatName } from "@/utils/auditUtils";
+import { formatPatientAge } from "@/utils/formatPatientAge";
 
 export default function DicomViewer({
+  facilityId,
+  patientId,
+  encounterId,
   studyUid,
   seriesUid,
   instanceUid,
 }: {
+  facilityId?: string;
+  patientId?: string;
+  encounterId?: string;
   studyUid: string;
   seriesUid?: string;
   instanceUid?: string;
 }) {
   const dicomViewerRef = useRef<HTMLIFrameElement>(null);
   const [iframeUrl, setIframeUrl] = useState<string | null>(null);
+  const [isPseudoFullscreen, setIsPseudoFullscreen] = useState(false);
   const { t } = useTranslation(PLUGIN_SLUG);
+  const {
+    canReadRadiology,
+    isLoading: isPermissionLoading,
+    isError: isPermissionError,
+  } = useRadiologyPermissions(facilityId);
+
+  useEffect(() => {
+    if (canReadRadiology || isPermissionLoading) return;
+    toast.error(
+      t(
+        isPermissionError
+          ? "radiology_permission_check_failed"
+          : "radiology_no_permission",
+      ),
+    );
+  }, [isPermissionLoading, isPermissionError, canReadRadiology, t]);
+
+  const { data: imagingStudies } = useEncounterImagingStudies(
+    patientId,
+    encounterId,
+    { enabled: canReadRadiology },
+  );
+
+  const { studyDate, serviceRequestName, serviceRequestId, createdBy } =
+    useMemo(() => {
+      for (const imagingStudy of imagingStudies?.results ?? []) {
+        const study = imagingStudy.studies.find(
+          (s) => s.study_uid === studyUid,
+        );
+        if (study) {
+          return {
+            studyDate: study.study_date,
+            serviceRequestName: imagingStudy.service_request?.title,
+            serviceRequestId: imagingStudy.service_request?.id,
+            createdBy: study.created_by,
+          };
+        }
+      }
+      return {};
+    }, [imagingStudies, studyUid]);
+
+  // Fetched directly so studies uploaded without a service request still show
+  // the patient.
+  const { data: patient } = useQuery({
+    queryKey: ["patient", patientId],
+    queryFn: () => apis.patient.retrieve(patientId!),
+    enabled: canReadRadiology && !!patientId,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  // The list API omits the requester; only the service request detail has it.
+  const { data: serviceRequestDetail } = useServiceRequestDetail(
+    canReadRadiology ? facilityId : undefined,
+    serviceRequestId,
+  );
+  const requester = serviceRequestDetail?.requester;
+
+  const infoRows = [
+    [
+      {
+        label: t("radiology_patient_name"),
+        value: patient?.name || "-",
+      },
+      {
+        label: t("radiology_sex"),
+        value: patient?.gender ? t(`radiology_gender_${patient.gender}`) : "-",
+      },
+      { label: t("radiology_age"), value: formatPatientAge(patient, t) },
+    ],
+    [
+      {
+        label: t("radiology_referred_physician"),
+        value: formatName(requester),
+      },
+      {
+        label: t("radiology_study_created_by"),
+        value: formatName(createdBy),
+      },
+    ],
+  ];
+
+  const ohifBaseUrl = useRadiologyViewerBaseUrl();
 
   const queryClient = useQueryClient();
   useEffect(() => {
+    if (!canReadRadiology || ohifBaseUrl === undefined) return;
     queryClient
       .ensureQueryData({ queryKey: ["user-refresh-token"] })
       .then((val) => {
         const token = (val as { access: string; refresh: string }).access;
 
-        const meta = window.__CARE_PLUGIN_RUNTIME__?.meta[PLUGIN_SLUG] as PlugConfigMeta;
-        const ohifBaseUrl = `${ meta?.config?.radiologyViewerBaseUrl || "" }`;
         if (studyUid && seriesUid && instanceUid) {
           setIframeUrl(
             `${ohifBaseUrl}/viewer?StudyInstanceUIDs=${studyUid}&initialSeriesInstanceUID=${seriesUid}&initialSopInstanceUID=${instanceUid}&token=${token}`
@@ -38,45 +134,122 @@ export default function DicomViewer({
           );
         }
       });
-  }, [queryClient]);
+  }, [queryClient, canReadRadiology, ohifBaseUrl]);
+
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+  useEffect(() => {
+    if (!isPseudoFullscreen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsPseudoFullscreen(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isPseudoFullscreen]);
 
   const goFullscreen = (ref: RefObject<HTMLIFrameElement>) => {
-    if (ref.current) ref.current.requestFullscreen();
+    const el = ref.current as
+      | (HTMLIFrameElement & { webkitRequestFullscreen?: () => void })
+      | null;
+    if (!el) return;
+    (el.requestFullscreen ?? el.webkitRequestFullscreen)?.call(el);
   };
 
-  if (!iframeUrl) return <div>Please Wait...</div>;
+  if (!canReadRadiology && isPermissionError) {
+    return (
+      <div id="dicom-viewer-page">
+        <EmptyState
+          className="flex-1 m-4"
+          title={t("radiology_permission_check_failed_title")}
+          description={t("radiology_permission_check_failed_description")}
+        />
+      </div>
+    );
+  }
+
+  if (!isPermissionLoading && !canReadRadiology) {
+    return (
+      <div id="dicom-viewer-page">
+        <EmptyState
+          className="flex-1 m-4"
+          title={t("radiology_no_access_title")}
+          description={t("radiology_no_access_description")}
+        />
+      </div>
+    );
+  }
+
+  if (!iframeUrl) return <div>{t("radiology_please_wait")}</div>;
 
   return (
-    <Card className="shadow-sm border border-gray-200 bg-white">
-      <CardHeader className="flex flex-row items-center justify-between pb-3">
-        <CardTitle className="text-xl font-semibold text-gray-800">
-          {t("dicom_viewer")}
-        </CardTitle>
-        <div className="flex gap-5 justify-end">
-          <Button
-            variant={"primary"}
-            onClick={() => {
-              goFullscreen(dicomViewerRef as RefObject<HTMLIFrameElement>);
-            }}
-          >
-            Fullscreen
-          </Button>
-          <Button
-            variant={"outline"}
-            color={"red"}
-            onClick={() => window.history.back()}
-          >
-            Close
-          </Button>
+    <div
+      id="dicom-viewer-page"
+      className={`flex flex-col bg-white rounded-lg overflow-hidden ${
+        isPseudoFullscreen ? "fixed inset-0 z-50 rounded-none" : ""
+      }`}
+    >
+      {!isPseudoFullscreen && (
+        <div className="flex flex-col items-stretch gap-2 px-4 py-3 border-b border-gray-200 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <span className="text-xl font-semibold text-gray-800 break-words">
+              {serviceRequestName
+                ? `${t("dicom_study_viewer")} (${serviceRequestName})`
+                : t("dicom_study_viewer")}
+            </span>
+            {studyDate && (
+              <span className="text-sm text-gray-500">
+                {t("radiology_study_date")}:{" "}
+                <span className="font-medium text-gray-700">
+                  {format(studyDate, "dd/MM/yyyy, hh:mm a")}
+                </span>
+              </span>
+            )}
+            {infoRows.map((row) => (
+              <div
+                key={row[0].label}
+                className="flex flex-wrap gap-x-4 gap-y-0.5 text-sm text-gray-500"
+              >
+                {row.map(({ label, value }) => (
+                  <span key={label} className="break-words">
+                    {label}:{" "}
+                    <span className="font-medium text-gray-700">{value}</span>
+                  </span>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2 sm:justify-end sm:gap-5">
+            <Button
+              variant={"primary"}
+              className="flex-1 sm:flex-none"
+              onClick={() => {
+                if (isIOS) {
+                  setIsPseudoFullscreen((prev) => !prev);
+                } else {
+                  goFullscreen(dicomViewerRef as RefObject<HTMLIFrameElement>);
+                }
+              }}
+            >
+              {t("radiology_fullscreen")}
+            </Button>
+            <Button
+              variant={"outline"}
+              color={"red"}
+              className="flex-1 sm:flex-none"
+              onClick={() => window.close()}
+            >
+              {t("radiology_close")}
+            </Button>
+          </div>
         </div>
-      </CardHeader>
-      <CardContent>
+      )}
+      <div className="flex-1 min-h-0 p-0 sm:p-4 relative">
         <iframe
           ref={dicomViewerRef}
-          className="rounded-xl border w-full h-[80vh]"
+          className="w-full h-full rounded-none border border-gray-200 sm:rounded-lg"
           src={iframeUrl}
         ></iframe>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

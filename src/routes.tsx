@@ -1,22 +1,37 @@
-import DicomUploader from "./components/DicomUploader";
-import DicomViewer from "./components/DicomViewer";
+import { lazy } from "react";
+
+import DicomViewer from "@/components/DicomViewer";
+
+const ObservationTemplateSettings = lazy(
+  () => import("@/pages/ObservationTemplateSettings"),
+);
 
 const routes = {
-  "/facility/:facilityid/patient/:patientid/encounter/:encounterid/radiology/uploader": (
-    { patientid, encounterid }: { facilityid: string, patientid: string, encounterid: string }
-  ) => (
-    <DicomUploader patientId={patientid} encounterId={encounterid} ></DicomUploader>
-  ),
-  "/radiology/view/:studyid": (
-    { studyid }: { studyid: string }
-  ) => (
-    <DicomViewer studyUid={studyid}></DicomViewer>
-  ),
-  "/facility/:facilityid/services_requests/radiology/view/:studyid": (
-    { studyid }: { studyid: string }
-  ) => (
-    <DicomViewer studyUid={studyid}></DicomViewer>
-  ),
+  "/facility/:facilityId/patient/:patientId/encounter/:encounterId/radiology/view/:studyid":
+    ({
+      facilityId,
+      patientId,
+      encounterId,
+      studyid,
+    }: {
+      facilityId: string;
+      patientId: string;
+      encounterId: string;
+      studyid: string;
+    }) => (
+      <DicomViewer
+        facilityId={facilityId}
+        patientId={patientId}
+        encounterId={encounterId}
+        studyUid={studyid}
+      ></DicomViewer>
+    ),
+
+  "/facility/:facilityId/settings/general/report_templates": ({
+    facilityId,
+  }: {
+    facilityId: string;
+  }) => <ObservationTemplateSettings facilityId={facilityId} />,
 };
 
 export default routes;
