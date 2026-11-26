@@ -1,46 +1,297 @@
 import { queryString, request } from "./request";
-
-// FIXME: Move all the api specific types to a ./types.ts file
+import { PaginatedResponse } from "./types";
+import { DicomStudyArchiveResponse } from "@/types/dicom";
+import { FacilityWithPermissions } from "@/types/facility";
+import { CurrentUser } from "@/types/user";
+import {
+  ObservationTemplate,
+  ObservationTemplateField,
+} from "@/types/observationTemplate";
+import {
+  ActivityDefinitionDetail,
+  ActivityDefinitionListItem,
+} from "@/types/activityDefinition";
+import { DiagnosticReport } from "@/types/diagnosticReports";
+import {
+  ArchiveState,
+  ImagingStudy,
+  ImagingStudyStatus,
+} from "@/types/imagingStudy";
+import { Patient } from "@/types/patient";
+import { CareDevice } from "@/types/modalityDevice";
 
 export const apis = {
-  dicom: {
-    fetchStudies: async (query?: {
-      facility?: string;
-      patient?: string;
-      ordering?: string;
-    }) => {
-      return await request<any>(
-        `/api/care_radiology/dicom/studies/${queryString({
-          patientId: query?.patient ?? "",
-        })}`
+  imagingStudy: {
+    list: async (
+      patientId: string,
+      query: {
+        encounter: string;
+        limit?: number;
+        offset?: number;
+        archive_state?: ArchiveState;
+      },
+    ): Promise<PaginatedResponse<ImagingStudy>> => {
+      const params: Record<string, string | number> = {
+        encounter: query.encounter,
+      };
+      if (query.limit !== undefined) params.limit = query.limit;
+      if (query.offset !== undefined) params.offset = query.offset;
+      if (query.archive_state) params.archive_state = query.archive_state;
+      return await request<PaginatedResponse<ImagingStudy>>(
+        `/api/care_radiology/patient/${patientId}/imaging_study/${queryString(params)}`,
       );
     },
 
-    upload: async (payload: FormData): Promise<DicomUploadResponse> => {
+    retrieve: async (
+      patientId: string,
+      serviceRequestId: string,
+      query?: { archive_state?: ArchiveState },
+    ): Promise<ImagingStudy> => {
+      return await request<ImagingStudy>(
+        `/api/care_radiology/patient/${patientId}/imaging_study/${serviceRequestId}/${queryString(
+          query?.archive_state ? { archive_state: query.archive_state } : {},
+        )}`,
+      );
+    },
+
+    updateStatus: async (
+      patientId: string,
+      serviceRequestId: string,
+      payload: { status: ImagingStudyStatus },
+    ): Promise<ImagingStudy> => {
+      return await request<ImagingStudy>(
+        `/api/care_radiology/patient/${patientId}/imaging_study/${serviceRequestId}/`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        },
+      );
+    },
+
+    upload: async (
+      patientId: string,
+      payload: FormData,
+    ): Promise<DicomUploadResponse> => {
       return await request<DicomUploadResponse>(
-        "/api/care_radiology/dicom/upload/",
+        `/api/care_radiology/patient/${patientId}/imaging_study/upload/`,
         {
           body: payload,
           method: "POST",
         },
         {
           isFormdata: true,
-        }
+        },
+      );
+    },
+
+    archive: async (
+      patientId: string,
+      studyId: string,
+      payload: { archive_reason: string },
+    ): Promise<DicomStudyArchiveResponse> => {
+      return await request<DicomStudyArchiveResponse>(
+        `/api/care_radiology/patient/${patientId}/imaging_study/${studyId}/archive/`,
+        {
+          body: JSON.stringify(payload),
+          method: "POST",
+        },
       );
     },
   },
+
+  facility: {
+    retrieve: async (facilityId: string): Promise<FacilityWithPermissions> => {
+      return await request<FacilityWithPermissions>(
+        `/api/v1/facility/${facilityId}/`,
+        { method: "GET" },
+      );
+    },
+  },
+
+  device: {
+    list: async (
+      facilityId: string,
+      query: {
+        care_type: string;
+        search_text?: string;
+        limit?: number;
+        offset?: number;
+      },
+    ): Promise<PaginatedResponse<CareDevice>> => {
+      return await request<PaginatedResponse<CareDevice>>(
+        `/api/v1/facility/${facilityId}/device/${queryString(
+          Object.fromEntries(
+            Object.entries(query).filter(([, value]) => value !== undefined),
+          ) as Record<string, string | number>,
+        )}`,
+        { method: "GET" },
+      );
+    },
+    // Core CARE device retrieve
+    retrieve: async (
+      facilityId: string,
+      deviceId: string,
+    ): Promise<CareDevice> => {
+      return await request<CareDevice>(
+        `/api/v1/facility/${facilityId}/device/${deviceId}/`,
+        { method: "GET" },
+      );
+    },
+  },
+
+  patient: {
+    retrieve: async (patientId: string): Promise<Patient> => {
+      return await request<Patient>(`/api/v1/patient/${patientId}/`, {
+        method: "GET",
+      });
+    },
+  },
+
+  user: {
+    current: async (): Promise<CurrentUser> => {
+      return await request<CurrentUser>("/api/v1/users/getcurrentuser/", {
+        method: "GET",
+      });
+    },
+  },
+
   servicerequest: {
-    fetchStudies: async (query: { serviceRequestId: string }) => {
+    retrieve: async (facilityId: string, serviceRequestId: string) => {
       return await request<any>(
-        `/api/care_radiology/dicom/service-requests${queryString({
-          serviceRequestId: query?.serviceRequestId ?? "",
-        })}`
-      )
-    }
-  }
+        `/api/v1/facility/${facilityId}/service_request/${serviceRequestId}/`,
+        { method: "GET" },
+      );
+    },
+  },
+
+  diagnosticReport: {
+    retrieve: async (patientId: string, diagnosticReportId: string) => {
+      return await request<any>(
+        `/api/v1/patient/${patientId}/diagnostic_report/${diagnosticReportId}/`,
+        { method: "GET" },
+      );
+    },
+
+    list: async (
+      patientId: string,
+      query: { encounter: string; limit?: number },
+    ): Promise<PaginatedResponse<DiagnosticReport>> => {
+      return await request<PaginatedResponse<DiagnosticReport>>(
+        `/api/v1/patient/${patientId}/diagnostic_report/${queryString({
+          encounter: query.encounter,
+          limit: query.limit ?? 14,
+        })}`,
+      );
+    },
+  },
+
+  observationTemplate: {
+    fetchAll: async (query: {
+      facility: string;
+      observation_definition?: string;
+      activity_definition?: string;
+      created_by?: string;
+      title?: string;
+      ordering?: string;
+      limit?: number;
+      offset?: number;
+    }): Promise<PaginatedResponse<ObservationTemplate>> => {
+      const params: Record<string, string | number> = {
+        facility: query.facility,
+      };
+      if (query.observation_definition) {
+        params.observation_definition = query.observation_definition;
+      }
+      if (query.activity_definition) {
+        params.activity_definition = query.activity_definition;
+      }
+      if (query.created_by) {
+        params.created_by = query.created_by;
+      }
+      if (query.ordering) {
+        params.ordering = query.ordering;
+      }
+      if (query.title) {
+        params.title = encodeURIComponent(query.title);
+      }
+      if (query.limit) {
+        params.limit = query.limit;
+      }
+      if (query.offset) {
+        params.offset = query.offset;
+      }
+      return await request<PaginatedResponse<ObservationTemplate>>(
+        `/api/care_radiology/observation_result_template/${queryString(params)}`,
+      );
+    },
+
+    create: async (payload: {
+      facility: string;
+      observation_definition: string;
+      activity_definition: string;
+      title: string;
+      description?: string;
+      fields: ObservationTemplateField[];
+    }): Promise<ObservationTemplate> => {
+      return await request<ObservationTemplate>(
+        "/api/care_radiology/observation_result_template/",
+        {
+          method: "POST",
+          body: JSON.stringify(payload),
+        },
+      );
+    },
+
+    update: async (
+      id: string,
+      payload: { title?: string; description?: string },
+    ): Promise<ObservationTemplate> => {
+      return await request<ObservationTemplate>(
+        `/api/care_radiology/observation_result_template/${id}/`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        },
+      );
+    },
+  },
+
+  activityDefinition: {
+    // Only `imaging` activity definitions are relevant to the radiology plug.
+    list: async (query: {
+      facility: string;
+      title?: string;
+      limit?: number;
+    }): Promise<PaginatedResponse<ActivityDefinitionListItem>> => {
+      const params: Record<string, string | number> = {
+        classification: "imaging",
+        status: "active",
+        limit: query.limit ?? 20,
+      };
+      if (query.title) {
+        params.title = encodeURIComponent(query.title);
+      }
+      return await request<PaginatedResponse<ActivityDefinitionListItem>>(
+        `/api/v1/facility/${query.facility}/activity_definition/${queryString(
+          params,
+        )}`,
+      );
+    },
+
+    // The list spec omits `observation_result_requirements`; only retrieve has it.
+    retrieve: async (
+      facilityId: string,
+      slug: string,
+    ): Promise<ActivityDefinitionDetail> => {
+      return await request<ActivityDefinitionDetail>(
+        `/api/v1/facility/${facilityId}/activity_definition/${slug}/`,
+      );
+    },
+  },
 };
 
 interface DicomUploadResponse {
   message: string;
   study_uid: string;
+  service_request_id?: string;
 }

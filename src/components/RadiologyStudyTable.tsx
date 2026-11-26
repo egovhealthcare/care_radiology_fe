@@ -1,5 +1,5 @@
-import { DicomStudy } from "@/types/Dicom";
-import { FC, useState } from "react";
+import { DicomStudy, DiagnosticReportStatus } from "@/types/dicom";
+import { FC, useMemo, useState } from "react";
 import {
   Table,
   TableBody,
@@ -7,131 +7,442 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "./ui/table";
-import { navigate } from "raviger";
-import { Eye, Info, X } from "lucide-react";
+} from "@/components/ui/table";
+import { Archive, Eye, FileText, Info, MoreHorizontal } from "lucide-react";
 import { format } from "date-fns";
-import React from "react";
+import { PLUGIN_SLUG } from "@/constants";
+import { useTranslation } from "react-i18next";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Label } from "@/components/ui/label";
+import { apis } from "@/apis";
+import { toast } from "@/lib/utils";
+import { formatName } from "@/utils/auditUtils";
+import { navigate } from "raviger";
 
-type RadiologyStudyTableProps = { className?: string, studies: DicomStudy[] };
-export const RadiologyStudyTable: FC<RadiologyStudyTableProps> = (props) => {
-  const [showModal, setShowModal] = useState(false);
+const formatUserName = (user?: DicomStudy["created_by"]) => {
+  const name = formatName(user);
+  return name === "-" ? "—" : name;
+};
+
+const formatSeriesValue = (value?: string | string[] | null) =>
+  (Array.isArray(value) ? value.join(", ") : value) || "—";
+
+type RadiologyStudyTableProps = {
+  className?: string;
+  studies?: DicomStudy[];
+  canArchive?: boolean;
+  onArchived?: () => void;
+  patientId?: string;
+  hideViewReport?: boolean;
+  hideActions?: boolean;
+};
+
+export const RadiologyStudyTable: FC<RadiologyStudyTableProps> = ({
+  className,
+  studies,
+  canArchive = false,
+  onArchived,
+  patientId,
+  hideViewReport = false,
+  hideActions = false,
+}) => {
+  const { t } = useTranslation(PLUGIN_SLUG);
+  const showViewReport = !hideActions && !hideViewReport;
+
   const [selectedStudy, setSelectedStudy] = useState<DicomStudy | null>(null);
-  const handleInfoClick = async (study: DicomStudy) => {
+  const [studyToArchive, setStudyToArchive] = useState<DicomStudy | null>(null);
+  const [archiveReason, setArchiveReason] = useState("");
+  const [isArchiving, setIsArchiving] = useState(false);
+  const selectedModalities =
+    (selectedStudy?.study_modalities as string[] | undefined)?.join(", ") ||
+    "—";
+
+  const facilityId = useMemo(() => {
+    const facilityMatch = window.location.pathname.match(/\/facility\/([^/]+)/);
+    return facilityMatch?.[1] ?? ":facilityId";
+  }, []);
+
+  const handleViewStudy = (study: DicomStudy) => {
+    window.open(
+      `/facility/${facilityId}/patient/${patientId}/encounter/${study.encounter_id}/radiology/view/${study.study_uid}`,
+      "_blank",
+      "noopener,noreferrer",
+    );
+  };
+
+  const handleViewReport = (diagnosticReportId: string) => {
+    navigate(
+      `/facility/${facilityId}/patient/${patientId}/diagnostic_reports/${diagnosticReportId}`,
+    );
+  };
+
+  const renderArchiveDetails = (study: DicomStudy) => (
+    <div className="rounded-lg border border-red-200 bg-red-50 overflow-hidden">
+      <div className="flex items-center gap-1.5 border-b border-red-200 bg-red-100 px-3 py-2 text-sm font-semibold text-red-900">
+        <Archive size={12} />
+        {t("radiology_archived")}
+      </div>
+      <dl className="flex flex-col gap-3 p-3 text-sm">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-x-8">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <dt className="text-sm font-semibold text-red-900">
+              {t("radiology_archived_on")}
+            </dt>
+            <dd className="break-words text-gray-900">
+              {(study.archived_datetime
+                ? format(study.archived_datetime, "dd MMM yyyy, hh:mm a")
+                : null) || "—"}
+            </dd>
+          </div>
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <dt className="text-sm font-semibold text-red-900">
+              {t("radiology_archived_by")}
+            </dt>
+            <dd className="break-words text-gray-900">
+              {formatUserName(study.archived_by)}
+            </dd>
+          </div>
+        </div>
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <dt className="text-sm font-semibold text-red-900">
+            {t("radiology_archive_reason")}
+          </dt>
+          <dd className="break-words text-gray-900">
+            {study.archive_reason || "—"}
+          </dd>
+        </div>
+      </dl>
+    </div>
+  );
+
+  const closeArchiveDialog = () => {
+    setStudyToArchive(null);
+    setArchiveReason("");
+  };
+
+  const handleArchive = async () => {
+    if (!studyToArchive || !patientId) return;
+
+    const reason = archiveReason.trim();
+    if (!reason) {
+      toast.warning(t("radiology_please_enter_archive_reason"));
+      return;
+    }
+
+    setIsArchiving(true);
     try {
-      setSelectedStudy(study);
-      // const response = await apis.dicom.fetchSeries({
-      //   studyId: study.id.toString(),
-      // });
-      // const data = response;
-      // setSeriesData(data);
-      setShowModal(true);
+      await apis.imagingStudy.archive(patientId, studyToArchive.id, {
+        archive_reason: reason,
+      });
+      toast.success(t("radiology_study_archived_successfully"));
+      closeArchiveDialog();
+      onArchived?.();
     } catch (error) {
-      console.error("Error fetching series info:", error);
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("radiology_failed_to_archive_study"),
+      );
+    } finally {
+      setIsArchiving(false);
     }
   };
+
   return (
-    <React.Fragment>
-      <div className={`${props.className ?? ''} rounded-md border`}>
-        {" "}
+    <>
+      <div
+        className={`${className ?? ""} min-w-0 overflow-hidden rounded-md border`}
+      >
         <Table>
-          <TableHeader>
-            <TableRow className="bg-gray-100">
-              <TableHead>Study Name</TableHead>
-              <TableHead>Study Date</TableHead>
-              <TableHead>Study Modality</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
+          <TableHeader className="bg-gray-100">
+            <TableRow className="divide-x divide-gray-200">
+              <TableHead className="whitespace-nowrap">
+                {t("radiology_study_name")}
+              </TableHead>
+              <TableHead className="whitespace-nowrap">
+                {t("radiology_accession_number")}
+              </TableHead>
+              <TableHead className="whitespace-nowrap">
+                {t("radiology_study_date")}
+              </TableHead>
+              <TableHead className="whitespace-nowrap">
+                {t("radiology_study_modality")}
+              </TableHead>
+              {!hideActions && (
+                <TableHead className="text-right whitespace-nowrap">
+                  {t("radiology_actions")}
+                </TableHead>
+              )}
             </TableRow>
           </TableHeader>
-          <TableBody>
-            {props.studies.map((study: DicomStudy) => (
-              <TableRow>
-                <TableCell>{study.study_description || "—"}</TableCell>
-                <TableCell>
+          <TableBody className="bg-white">
+            {studies?.map((study: DicomStudy) => (
+              <TableRow key={study.id} className="divide-x divide-gray-200">
+                <TableCell className="font-medium">
+                  {study.study_description || "—"}
+                </TableCell>
+                <TableCell className="whitespace-nowrap">
+                  {study.accession_number || "—"}
+                </TableCell>
+                <TableCell className="whitespace-nowrap">
                   {(study.study_date
                     ? format(study.study_date, "dd MMMM, yyyy")
                     : null) || "—"}
                 </TableCell>
-                <TableCell>
-                  {(study.study_modalities as string[])?.join(", ") || "—"}
-                </TableCell>
-                <TableCell>
-                  <div className="flex gap-3 items-center justify-end">
-                    <button
-                      onClick={() =>
-                        navigate(`/radiology/view/${study.study_uid}`)
-                      }
-                      className="text-gray-600 hover:text-blue-600"
-                      title="View Study"
-                    >
-                      <Eye size={18} />
-                    </button>
-                    <button
-                      onClick={() => handleInfoClick(study)}
-                      className="text-gray-600 hover:text-green-600"
-                      title="Study Info"
-                    >
-                      <Info size={18} />
-                    </button>
+                <TableCell className="whitespace-nowrap">
+                  <div>
+                    {(study.study_modalities as string[])?.join(", ") || "—"}
                   </div>
+                  {study.service_request?.title && (
+                    <div className="text-xs text-gray-500">
+                      {study.service_request.title}
+                    </div>
+                  )}
                 </TableCell>
+                {!hideActions && (
+                  <TableCell>
+                    <div className="flex gap-2 items-center justify-end whitespace-nowrap">
+                      {study.is_archived && (
+                        <Badge variant="destructive">
+                          {t("radiology_archived")}
+                        </Badge>
+                      )}
+                      {showViewReport &&
+                        !study.is_archived &&
+                        patientId &&
+                        study.service_request?.diagnostic_report_id && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() =>
+                              handleViewReport(
+                                study.service_request!.diagnostic_report_id!,
+                              )
+                            }
+                            className="text-xs h-auto py-1 px-2"
+                          >
+                            <FileText size={16} className="mr-1" />
+                            {t("dicom_view_report")}
+                          </Button>
+                        )}
+                      {!study.is_archived &&
+                        patientId &&
+                        study.encounter_id && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleViewStudy(study)}
+                            className="text-xs h-auto py-1 px-2"
+                          >
+                            <Eye size={16} className="mr-1" />
+                            {t("dicom_view_study")}
+                          </Button>
+                        )}
+                      {study.is_archived ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setSelectedStudy(study)}
+                          className="text-xs h-auto py-1 px-2"
+                        >
+                          <Info size={16} className="mr-1" />
+                          {t("radiology_info")}
+                        </Button>
+                      ) : (
+                        <DropdownMenu modal={false}>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="text-xs h-auto py-1 px-2"
+                              aria-label={t("radiology_more_options")}
+                            >
+                              <MoreHorizontal size={16} />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onSelect={() => setSelectedStudy(study)}
+                            >
+                              <Info size={16} />
+                              {t("radiology_info")}
+                            </DropdownMenuItem>
+                            {canArchive &&
+                              patientId &&
+                              !study.is_archived &&
+                              study.service_request
+                                ?.diagnostic_report_status !==
+                                DiagnosticReportStatus.final && (
+                                <DropdownMenuItem
+                                  onSelect={() => setStudyToArchive(study)}
+                                >
+                                  <Archive size={16} />
+                                  {t("radiology_archive")}
+                                </DropdownMenuItem>
+                              )}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      )}
+                    </div>
+                  </TableCell>
+                )}
               </TableRow>
             ))}
           </TableBody>
         </Table>
       </div>
 
-      {showModal && selectedStudy && (
-        <div className="fixed inset-0 bg-white/40 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl shadow-lg w-[400px] relative p-5">
-            {/* Close icon */}
-            <button
-              className="absolute top-3 right-3 text-gray-600 hover:text-red-600"
-              onClick={() => setShowModal(false)}
-            >
-              <X size={20} />
-            </button>
+      <Dialog
+        open={!!selectedStudy}
+        onOpenChange={(open) => !open && setSelectedStudy(null)}
+      >
+        <DialogContent className="max-w-[calc(100%-2rem)] sm:max-w-lg">
+          {selectedStudy && (
+            <>
+              <DialogHeader>
+                <DialogTitle>
+                  {selectedStudy.study_description || "—"}
+                </DialogTitle>
+              </DialogHeader>
 
-            {/* Header */}
-            <h3 className="text-lg font-semibold text-gray-800 mb-2">
-              {selectedStudy.study_description}{" "}
-              {(selectedStudy.study_modalities as string[]).join(", ") || "—"}
-            </h3>
+              <div className="grid grid-cols-2 gap-x-8 gap-y-6 mb-4">
+                <div className="flex flex-col items-start gap-1">
+                  <span className="text-sm font-semibold text-gray-700">
+                    {t("radiology_study_date")}
+                  </span>
+                  <span className="text-sm text-gray-700">
+                    {(selectedStudy.study_date
+                      ? format(selectedStudy.study_date, "dd MMMM, yyyy")
+                      : null) || "—"}
+                  </span>
+                </div>
+                <div className="flex flex-col items-start gap-1">
+                  <span className="text-sm font-semibold text-gray-700">
+                    {t("radiology_study_modality")}
+                  </span>
+                  <span className="text-sm text-gray-700">
+                    {selectedModalities}
+                  </span>
+                </div>
+                <div className="flex flex-col items-start gap-1">
+                  <span className="text-sm font-semibold text-gray-700">
+                    {t("radiology_created_by")}
+                  </span>
+                  <span className="text-sm text-gray-700">
+                    {formatUserName(selectedStudy.created_by)}
+                  </span>
+                </div>
+                <div className="flex flex-col items-start gap-1">
+                  <span className="text-sm font-semibold text-gray-700">
+                    {t("radiology_updated_by")}
+                  </span>
+                  <span className="text-sm text-gray-700">
+                    {formatUserName(selectedStudy.updated_by)}
+                  </span>
+                </div>
+              </div>
 
-            <div className="flex items-center gap-2 mb-4">
-              <span className="px-3 py-1 bg-gray-100 rounded-md text-sm text-gray-700">
-                {(selectedStudy.study_date
-                  ? format(selectedStudy.study_date, "dd MMMM, yyyy")
-                  : null) || "—"}
-              </span>
-              {selectedStudy.study_series.length > 0 && (
-                <span className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded-md font-medium uppercase">
-                  {(selectedStudy.study_modalities as string[]).join(", ") ||
-                    "—"}
-                </span>
-              )}
-            </div>
+              <div
+                className={`border rounded-lg bg-gray-50 overflow-hidden ${selectedStudy.is_archived ? "mb-4" : ""}`}
+              >
+                <div className="flex justify-between gap-4 border-b bg-gray-100 px-3 py-2 text-sm font-semibold text-gray-700">
+                  <span>{t("radiology_series_description")}</span>
+                  <span>{t("radiology_instance_count")}</span>
+                </div>
+                <div className="p-3">
+                  {selectedStudy.study_series.length > 0 ? (
+                    selectedStudy.study_series.map((series) => (
+                      <div
+                        key={series.series_uid}
+                        className="flex justify-between gap-4 text-sm text-gray-800 py-1"
+                      >
+                        <span>
+                          {formatSeriesValue(series.series_description)}
+                        </span>
+                        <span>
+                          {formatSeriesValue(series.series_instance_count)}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-gray-500 text-sm">
+                      {t("radiology_no_series_found")}
+                    </p>
+                  )}
+                </div>
+              </div>
 
-            {/* Series box */}
-            <div className="border rounded-lg p-3 bg-gray-50">
-              {selectedStudy.study_series.length > 0 ? (
-                selectedStudy.study_series.map((series) => (
-                  <div
-                    key={series.series_uid}
-                    className="flex justify-between text-sm text-gray-800 py-1"
-                  >
-                    <span>{series.series_description || "—"}</span>
-                    <span>{series.series_instance_count || "—"}</span>
-                  </div>
-                ))
-              ) : (
-                <p className="text-gray-500 text-sm">No series found</p>
-              )}
-            </div>
+              {selectedStudy.is_archived && renderArchiveDetails(selectedStudy)}
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!studyToArchive}
+        onOpenChange={(open) => !open && closeArchiveDialog()}
+      >
+        <DialogContent className="max-w-[calc(100%-2rem)] sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("radiology_archive_study")}</DialogTitle>
+            <DialogDescription>
+              {t("radiology_archive_study_description", {
+                study:
+                  studyToArchive?.study_description ||
+                  studyToArchive?.study_uid,
+              })}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="grid gap-2">
+            <Label htmlFor="archive-reason">
+              {t("radiology_archive_reason")}
+            </Label>
+            <textarea
+              id="archive-reason"
+              rows={3}
+              value={archiveReason}
+              onChange={(e) => setArchiveReason(e.target.value)}
+              placeholder={t("radiology_enter_archive_reason")}
+              className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm shadow-xs placeholder:text-gray-500 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-gray-950 disabled:opacity-50"
+            />
           </div>
-        </div>
-      )}
-    </React.Fragment>
+
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              onClick={closeArchiveDialog}
+              disabled={isArchiving}
+            >
+              {t("radiology_cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleArchive}
+              loading={isArchiving}
+              disabled={!archiveReason.trim()}
+            >
+              {t("radiology_archive")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 };
 
