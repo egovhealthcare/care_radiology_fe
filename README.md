@@ -294,5 +294,3 @@ care_fe picks the plugin up either through `localDevPluginManifests` (local dev)
 or through the `meta.url` remote entry. Env vars are exposed with the `REACT_`
 prefix (`envPrefix` in `vite.config.mjs`). `dist/` is deployed as a static
 Cloudflare Workers asset bundle (`wrangler.jsonc`).
-
-
